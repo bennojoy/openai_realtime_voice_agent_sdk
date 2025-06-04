@@ -4,7 +4,6 @@ import time
 import logging
 from agents import Agent, Voice
 from runner import Runner
-from audio_processor import AudioProcessor
 import sounddevice as sd
 import numpy as np
 import os
@@ -30,7 +29,7 @@ def record_audio(duration=5, output_file="input.wav"):
     CHUNK = 1024
     FORMAT = pyaudio.paInt16
     CHANNELS = 1
-    RATE = 24000  # Changed to 48kHz
+    RATE = 24000
     
     p = pyaudio.PyAudio()
     
@@ -82,13 +81,13 @@ def play_audio(audio_chunks):
     audio_array = np.frombuffer(audio_data, dtype=np.int16)
     
     # Play audio
-    sd.play(audio_array, AudioProcessor.TARGET_SAMPLE_RATE)
+    sd.play(audio_array, 24000)  # Using OpenAI's sample rate
     sd.wait()  # Wait until audio is finished playing
     
     logger.info("Audio playback finished")
 
 def main():
-    # Record audio at 48kHz
+    # Record audio
     record_audio(duration=5, output_file="input.wav")
     
     # Create voice + text agent
@@ -99,36 +98,11 @@ def main():
         enable_text=True  # Enable text modality
     )
     
-    # Process the audio file and save the converted version if needed
-    logger.info("Processing audio file for OpenAI...")
-    input_size = os.path.getsize("input.wav")
-    logger.info(f"Input file size: {input_size} bytes")
-    
-    processed_audio = AudioProcessor.process_audio_file("input.wav", voice_text_agent.input_audio)
-    processed_size = len(processed_audio)
-    logger.info(f"Processed audio size: {processed_size} bytes")
-    
-    # Only save if the audio was actually converted (accounting for small PCM16 conversion differences)
-    size_diff = abs(processed_size - input_size)
-    if size_diff > 100:  # Only consider it a conversion if size difference is significant
-        logger.info(f"Audio was converted (size changed from {input_size} to {processed_size}), saving to converted_input.wav")
-        try:
-            with open("converted_input.wav", "wb") as f:
-                logger.debug("Opening converted_input.wav for writing")
-                f.write(processed_audio)
-                logger.debug(f"Written {len(processed_audio)} bytes to converted_input.wav")
-            logger.info("Successfully saved converted_input.wav")
-        except Exception as e:
-            logger.error(f"Failed to save converted_input.wav: {e}")
-            raise
-    else:
-        logger.info(f"No significant conversion needed (size difference: {size_diff} bytes), using input.wav directly")
-    
-    # Run translation with voice+text agent using the processed audio
+    # Run translation with voice+text agent
     logger.info("Running translation with voice+text agent...")
     result = Runner.run_sync(
         voice_text_agent,
-        processed_audio,  # Use the processed audio directly instead of the file path
+        "input.wav",  # Pass the file path directly
         api_key=None  # Will use OPENAI_API_KEY environment variable
     )
     
