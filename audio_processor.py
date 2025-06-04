@@ -38,24 +38,41 @@ class AudioProcessor:
         Returns:
             bytes: Converted audio data
         """
-        logger.debug(f"Converting audio from {input_format.value} to {output_format.value}")
+        logger.info(f"Starting audio conversion from {input_format.value} to {output_format.value}")
+        logger.debug(f"Input params: {input_params}")
+        logger.debug(f"Output params: {output_params}")
         
         # Create temporary files for input and output
         with tempfile.NamedTemporaryFile(suffix=f".{input_format.value}", delete=False) as input_file, \
-             tempfile.NamedTemporaryFile(suffix=f".{output_format.value}", delete=False) as output_file:
+             tempfile.NamedTemporaryFile(suffix=f".{output_format.value if output_format != AudioFormat.PCM16 else 'wav'}", delete=False) as output_file:
+            
+            logger.debug(f"Created temporary files: {input_file.name} -> {output_file.name}")
             
             # Write input data
             input_file.write(audio_data)
             input_file.flush()
+            logger.debug(f"Written {len(audio_data)} bytes to input file")
             
             # Build ffmpeg command
             cmd = ["ffmpeg", "-y"]  # -y to overwrite output file
             
             # Input options
-            cmd.extend(["-f", input_format.value])
-            if input_format == AudioFormat.OPUS:
+            cmd.extend(["-f", "s16le"])  # Use s16le format for PCM16
+            if input_format.value == AudioFormat.OPUS:
                 cmd.extend(["-application", input_params.get("application", "voip")])
             cmd.extend(["-i", input_file.name])
+            
+            # Add audio filters for all required conversions
+            filters = []
+            
+            # Convert to mono if needed
+            filters.append("channelsplit=channel_layout=stereo[left][right];[left][right]amerge=inputs=2")
+            
+            # Resample to target rate with high quality
+            filters.append("aresample=24000:filter_size=256:cutoff=0.8:phase_shift=10")
+            
+            # Combine all filters
+            cmd.extend(["-filter_complex", ",".join(filters)])
             
             # Output options
             if output_format == AudioFormat.OPUS:
@@ -77,18 +94,25 @@ class AudioProcessor:
                 ])
             elif output_format == AudioFormat.FLAC:
                 cmd.extend(["-c:a", "flac"])
+            elif output_format == AudioFormat.PCM16:
+                cmd.extend(["-c:a", "pcm_s16le", "-f", "wav"])  # Output as WAV
             elif output_format == AudioFormat.WAV:
                 cmd.extend(["-c:a", "pcm_s16le"])
             
             cmd.append(output_file.name)
             
+            logger.debug(f"Running ffmpeg command: {' '.join(cmd)}")
+            
             # Run ffmpeg
             try:
-                subprocess.run(cmd, check=True, capture_output=True)
+                result = subprocess.run(cmd, check=True, capture_output=True)
+                logger.debug("FFmpeg conversion completed successfully")
                 
                 # Read output file
                 with open(output_file.name, 'rb') as f:
-                    return f.read()
+                    output_data = f.read()
+                    logger.info(f"Read {len(output_data)} bytes from output file")
+                    return output_data
                     
             except subprocess.CalledProcessError as e:
                 logger.error(f"FFmpeg conversion failed: {e.stderr.decode()}")
@@ -97,6 +121,7 @@ class AudioProcessor:
                 # Clean up temporary files
                 os.unlink(input_file.name)
                 os.unlink(output_file.name)
+                logger.debug("Cleaned up temporary files")
 
     @staticmethod
     def process_audio_file(file_path: str, audio_config: AudioConfig) -> bytes:
@@ -110,38 +135,46 @@ class AudioProcessor:
         Returns:
             bytes: Processed audio data in the required format
         """
-        logger.info(f"Processing audio file: {file_path}")
+        logger.info(f"Starting audio file processing: {file_path}")
+        logger.debug(f"Audio config: format={audio_config.format}, sample_rate={audio_config.sample_rate}, channels={audio_config.channels}")
         
-        # Read the file
-        data, samplerate = sf.read(file_path, dtype='float32')
-        
-        # Convert to mono if stereo
-        if len(data.shape) > 1:
-            logger.debug("Converting stereo to mono")
-            data = data.mean(axis=1)
-        
-        # Resample to target sample rate if needed
-        if samplerate != audio_config.sample_rate:
-            logger.debug(f"Resampling from {samplerate}Hz to {audio_config.sample_rate}Hz")
-            samples = len(data)
-            new_samples = int(samples * audio_config.sample_rate / samplerate)
-            data = signal.resample(data, new_samples)
-        
-        # Convert to PCM16 for OpenAI
-        pcm_data = (data * 32767).astype(np.int16)
-        pcm_bytes = pcm_data.tobytes()
-        
-        # If input format is not PCM16, convert it
-        if audio_config.format != AudioFormat.PCM16:
-            pcm_bytes = AudioProcessor.convert_audio_codec(
-                pcm_bytes,
-                AudioFormat.PCM16,
-                audio_config.format,
-                {},  # No parameters for PCM16
-                audio_config.codec_params
+        # First check if we need conversion by reading WAV header
+        with wave.open(file_path, 'rb') as wf:
+            channels = wf.getnchannels()
+            sample_width = wf.getsampwidth()
+            framerate = wf.getframerate()
+            n_frames = wf.getnframes()
+            
+            logger.info(f"Input WAV: {framerate}Hz, {channels} channels, {sample_width} bytes per sample")
+            
+            # Check if conversion is needed
+            needs_conversion = (
+                framerate != audio_config.sample_rate or  # Sample rate mismatch
+                channels != audio_config.channels or  # Channel count mismatch
+                sample_width != 2 or  # Not 16-bit PCM
+                audio_config.format != AudioFormat.PCM16  # Format mismatch
             )
+            
+            logger.info(f"Conversion check: sample_rate_match={framerate == audio_config.sample_rate}, "
+                       f"channels_match={channels == audio_config.channels}, "
+                       f"format_match={sample_width == 2 and audio_config.format == AudioFormat.PCM16}")
+            
+            if not needs_conversion:
+                logger.info("Input audio already matches required format, using raw PCM data")
+                return wf.readframes(n_frames)
         
-        return pcm_bytes
+        logger.info("Conversion needed, processing with FFmpeg...")
+        # If conversion is needed, use FFmpeg
+        with open(file_path, 'rb') as f:
+            audio_data = f.read()
+            
+        return AudioProcessor.convert_audio_codec(
+            audio_data,
+            AudioFormat.WAV,
+            audio_config.format,
+            {"sample_rate": framerate},
+            audio_config.codec_params
+        )
 
     @staticmethod
     def process_audio_stream(audio_data: bytes, audio_config: AudioConfig) -> bytes:
@@ -155,10 +188,12 @@ class AudioProcessor:
         Returns:
             bytes: Processed audio data in the required format
         """
-        logger.debug("Processing audio stream")
+        logger.info(f"Starting audio stream processing: {len(audio_data)} bytes")
+        logger.debug(f"Audio config: format={audio_config.format}, sample_rate={audio_config.sample_rate}, channels={audio_config.channels}")
         
         # If input format is not PCM16, convert it
         if audio_config.format != AudioFormat.PCM16:
+            logger.debug(f"Converting from {audio_config.format} to PCM16")
             audio_data = AudioProcessor.convert_audio_codec(
                 audio_data,
                 audio_config.format,
@@ -166,6 +201,7 @@ class AudioProcessor:
                 audio_config.codec_params,
                 {}  # No parameters for PCM16
             )
+            logger.debug(f"Conversion completed: {len(audio_data)} bytes")
         
         return audio_data
 
@@ -181,10 +217,12 @@ class AudioProcessor:
         Returns:
             bytes: Processed audio data in the required output format
         """
-        logger.debug("Processing response audio")
+        logger.info(f"Starting response audio processing: {len(audio_data)} bytes")
+        logger.debug(f"Audio config: format={audio_config.format}, sample_rate={audio_config.sample_rate}, channels={audio_config.channels}")
         
         # If output format is not PCM16, convert it
         if audio_config.format != AudioFormat.PCM16:
+            logger.debug(f"Converting from PCM16 to {audio_config.format}")
             audio_data = AudioProcessor.convert_audio_codec(
                 audio_data,
                 AudioFormat.PCM16,
@@ -192,6 +230,7 @@ class AudioProcessor:
                 {},  # No parameters for PCM16
                 audio_config.codec_params
             )
+            logger.debug(f"Conversion completed: {len(audio_data)} bytes")
         
         return audio_data
 
