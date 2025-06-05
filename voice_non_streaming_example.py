@@ -2,7 +2,7 @@ import pyaudio
 import wave
 import time
 import logging
-from agents import Agent, Voice
+from agents import Agent, Voice, AudioConfig, AudioFormat
 from runner import Runner
 import sounddevice as sd
 import numpy as np
@@ -29,7 +29,7 @@ def record_audio(duration=5, output_file="input.wav"):
     CHUNK = 1024
     FORMAT = pyaudio.paInt16
     CHANNELS = 1
-    RATE = 48000
+    RATE = 24000  # Match OpenAI's sample rate
     
     p = pyaudio.PyAudio()
     
@@ -92,28 +92,56 @@ def main():
     
     # Create voice + text agent
     voice_text_agent = Agent(
-        name="French Translator with Text",
+        name="Voice Assistant",
         instructions="You are a helpful assistant, respond to user in a friendly and helpful manner",
         voice=Voice.SAGE,
+        input_audio=AudioConfig(
+            format=AudioFormat.PCM16,
+            sample_rate=24000,
+            channels=1
+        ),
+        output_audio=AudioConfig(
+            format=AudioFormat.PCM16,
+            sample_rate=24000,
+            channels=1
+        ),
         enable_text=True  # Enable text modality
     )
     
-    # Run translation with voice+text agent
-    logger.info("Running translation with voice+text agent...")
-    result = Runner.run_sync(
-        voice_text_agent,
-        "input.wav",  # Pass the file path directly
-        api_key=None  # Will use OPENAI_API_KEY environment variable
-    )
+    def response_done_handler(response):
+        logger.info("Response done handler called")
+        logger.info(f"Response text: {response.text}")
+        if response.audio_chunks:
+            play_audio(response.audio_chunks)
+        else:
+            logger.warning("No audio response received")
     
-    # Print the transcription and translation
-    logger.info(f"Transcription: {result.text}")
+    # Create runner
+    runner = Runner(voice_text_agent, is_streaming=False,
+                    on_response_done=response_done_handler)
     
-    # Play the response audio
-    if result.audio_chunks:
-        play_audio(result.audio_chunks)
-    else:
-        logger.warning("No audio response received")
+    # Run the conversation
+    logger.info("Starting conversation...")
+    runner.init()
+    
+    try:
+        # Send the recorded audio file
+        with open("input.wav", "rb") as f:
+            audio_data = f.read()
+        runner._send_audio_input(audio_data)
+        
+        # Wait for the response to complete
+        time.sleep(10)  # Give enough time for the response to complete
+                
+    except KeyboardInterrupt:
+        logger.info("Stopping conversation...")
+    finally:
+        runner._disconnect()
+        # Clean up the temporary file
+        try:
+            os.remove("input.wav")
+        except:
+            pass
 
 if __name__ == "__main__":
     main() 

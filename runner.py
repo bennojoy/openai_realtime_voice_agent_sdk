@@ -42,7 +42,8 @@ class Runner:
                  on_audio_delta: Optional[Callable[[str], None]] = None,
                  on_transcript_user: Optional[Callable[[str], None]] = None,
                  on_transcript_ai: Optional[Callable[[str], None]] = None,
-                 on_speech_stopped: Optional[Callable[[], None]] = None):
+                 on_speech_stopped: Optional[Callable[[], None]] = None,
+                 on_response_done: Optional[Callable] = None):
         """
         Initialize the runner.
         
@@ -54,6 +55,7 @@ class Runner:
             on_transcript_user: Callback for user transcript events
             on_transcript_ai: Callback for AI transcript events
             on_speech_stopped: Callback for speech stopped events
+            on_response_done: Callback for response done events
         """
         self.api_key = api_key or os.getenv('OPENAI_API_KEY')
         if not self.api_key:
@@ -65,6 +67,7 @@ class Runner:
         self.on_transcript_user = on_transcript_user
         self.on_transcript_ai = on_transcript_ai
         self.on_speech_stopped = on_speech_stopped
+        self.on_response_done = on_response_done
         
         self.ws = None
         self.response_queue = queue.Queue()
@@ -73,7 +76,6 @@ class Runner:
         self._connected = threading.Event()
         self._session_updated = threading.Event()
         self._audio_buffer = []
-        self.on_response_done = None  # Initialize response done callback
         self.on_audio_transcript_done = None  # Initialize audio transcript done callback
 
     def init(self):
@@ -172,7 +174,7 @@ class Runner:
                     self.response_queue.put(self.current_response)
                 # Call response done callback
                 if hasattr(self, 'on_response_done') and self.on_response_done:
-                    self.on_response_done(event)
+                    self.on_response_done(self.current_response)
                 self.current_response = Response()
 
     def _on_error(self, ws, error):
@@ -360,6 +362,7 @@ class Runner:
                 "type": "input_audio_buffer.commit"
             }))
             logger.debug("Committed audio buffer")
+            self._create_response()
 
     def _create_response(self):
         logger.info("Creating response")
