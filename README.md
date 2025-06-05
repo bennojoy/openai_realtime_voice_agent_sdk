@@ -1,183 +1,342 @@
 # OpenAI Realtime WebSocket Python SDK
 
-A Python SDK for interacting with OpenAI's Realtime WebSocket API, providing a simple interface for text and voice interactions.
+This SDK provides a Python interface for interacting with OpenAI's Realtime API using WebSockets. It supports both streaming and non-streaming modes for voice and text interactions.
 
 ## Installation
 
+1. Clone the repository:
+   ```bash
+   git clone https://github.com/yourusername/openai-realtime-websocket-python-sdk.git
+   cd openai-realtime-websocket-python-sdk
+   ```
+
+2. Create a virtual environment and activate it:
+   ```bash
+   python -m venv venv
+   source venv/bin/activate  # On Windows, use `venv\Scripts\activate`
+   ```
+
+3. Install the required dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+## System Requirement: FFmpeg
+
+This SDK requires [FFmpeg](https://ffmpeg.org/) to be installed on your system for audio processing.
+
+### Install FFmpeg
+
+**macOS (using Homebrew):**
 ```bash
-pip install -r requirements.txt
+brew install ffmpeg
 ```
+
+**Ubuntu/Debian:**
+```bash
+sudo apt update
+sudo apt install ffmpeg
+```
+
+**Windows:**
+- Download the latest static build from [ffmpeg.org/download.html](https://ffmpeg.org/download.html)
+- Extract the files and add the `bin` folder to your system `PATH`.
 
 ## Usage
 
-### Basic Text Interaction
+### Non-Streaming Example
+
+The `voice_non_streaming_example.py` demonstrates how to record audio, send it to OpenAI, and play the response:
 
 ```python
-from agents import Agent, Runner, Voice
+import pyaudio
+import wave
+import time
+import logging
+from agents import Agent, Voice, AudioConfig, AudioFormat
+from runner import Runner
+import sounddevice as sd
+import numpy as np
+import os
 
-# Create an agent with instructions
-agent = Agent(
-    name="Assistant",
-    instructions="You are a helpful assistant"
+# Configure logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
+logger = logging.getLogger(__name__)
 
-# Run a synchronous text interaction
-result = Runner.run_sync(
-    agent,
-    "Write a haiku about programming",
-    api_key="your-api-key"
-)
+def record_audio(duration=5, output_file="input.wav"):
+    """Record audio for specified duration and save to WAV file."""
+    logger.info(f"Recording {duration} seconds of audio...")
+    
+    # Audio recording parameters
+    CHUNK = 1024
+    FORMAT = pyaudio.paInt16
+    CHANNELS = 1
+    RATE = 24000  # Match OpenAI's sample rate
+    
+    p = pyaudio.PyAudio()
+    
+    # Open audio stream
+    stream = p.open(format=FORMAT,
+                   channels=CHANNELS,
+                   rate=RATE,
+                   input=True,
+                   frames_per_buffer=CHUNK)
+    
+    logger.info(f"Recording started at {RATE}Hz...")
+    frames = []
+    
+    # Record audio
+    for i in range(0, int(RATE / CHUNK * duration)):
+        data = stream.read(CHUNK)
+        frames.append(data)
+    
+    logger.info("Recording finished")
+    
+    # Stop and close the stream
+    stream.stop_stream()
+    stream.close()
+    p.terminate()
+    
+    # Save the recorded audio
+    wf = wave.open(output_file, 'wb')
+    wf.setnchannels(CHANNELS)
+    wf.setsampwidth(p.get_sample_size(FORMAT))
+    wf.setframerate(RATE)
+    wf.writeframes(b''.join(frames))
+    wf.close()
+    
+    logger.info(f"Audio saved to {output_file} at {RATE}Hz")
 
-print(result.text)
+def play_audio(audio_chunks):
+    """Play audio chunks using sounddevice."""
+    logger.info("Playing response audio...")
+    
+    # Combine all chunks
+    audio_data = b''.join(audio_chunks)
+    
+    # Convert to numpy array
+    audio_array = np.frombuffer(audio_data, dtype=np.int16)
+    
+    # Play audio
+    sd.play(audio_array, 24000)  # Using OpenAI's sample rate
+    sd.wait()  # Wait until audio is finished playing
+    
+    logger.info("Audio playback finished")
+
+def main():
+    # Record audio
+    record_audio(duration=5, output_file="input.wav")
+    
+    # Create voice + text agent
+    voice_text_agent = Agent(
+        name="Voice Assistant",
+        instructions="You are a helpful assistant, respond to user in a friendly and helpful manner",
+        voice=Voice.SAGE,
+        input_audio=AudioConfig(
+            format=AudioFormat.PCM16,
+            sample_rate=24000,
+            channels=1
+        ),
+        output_audio=AudioConfig(
+            format=AudioFormat.PCM16,
+            sample_rate=24000,
+            channels=1
+        ),
+        enable_text=True  # Enable text modality
+    )
+    
+    def response_done_handler(response):
+        logger.info("Response done handler called")
+        logger.info(f"Response text: {response.text}")
+        if response.audio_chunks:
+            play_audio(response.audio_chunks)
+        else:
+            logger.warning("No audio response received")
+    
+    # Create runner
+    runner = Runner(voice_text_agent, is_streaming=False,
+                    on_response_done=response_done_handler)
+    
+    # Run the conversation
+    logger.info("Starting conversation...")
+    runner.init()
+    
+    try:
+        # Send the recorded audio file
+        with open("input.wav", "rb") as f:
+            audio_data = f.read()
+        runner._send_audio_input(audio_data)
+        
+        # Wait for the response to complete
+        time.sleep(10)  # Give enough time for the response to complete
+                
+    except KeyboardInterrupt:
+        logger.info("Stopping conversation...")
+    finally:
+        runner._disconnect()
+        # Clean up the temporary file
+        try:
+            os.remove("input.wav")
+        except:
+            pass
+
+if __name__ == "__main__":
+    main()
 ```
 
-### Voice Interaction
+### Streaming Example
+
+The `voice_streaming_example.py` demonstrates how to stream audio in real-time:
 
 ```python
-from agents import Agent, Runner, Voice
-import soundfile as sf
+import pyaudio
+import wave
+import time
+import logging
+from agents import Agent, Voice, AudioConfig, AudioFormat
+from runner import Runner
+import sounddevice as sd
+import numpy as np
+import os
 
-# Create an agent with voice capabilities
-agent = Agent(
-    name="Voice Assistant",
-    instructions="You are a helpful voice assistant",
-    voice=Voice.SAGE  # Choose from available voices
+# Configure logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
+logger = logging.getLogger(__name__)
 
-# Read audio file
-audio_data, _ = sf.read("input.wav", dtype='float32')
-audio_bytes = (audio_data * 32767).astype('int16').tobytes()
+def record_audio(duration=5, output_file="input.wav"):
+    """Record audio for specified duration and save to WAV file."""
+    logger.info(f"Recording {duration} seconds of audio...")
+    
+    # Audio recording parameters
+    CHUNK = 1024
+    FORMAT = pyaudio.paInt16
+    CHANNELS = 1
+    RATE = 24000  # Match OpenAI's sample rate
+    
+    p = pyaudio.PyAudio()
+    
+    # Open audio stream
+    stream = p.open(format=FORMAT,
+                   channels=CHANNELS,
+                   rate=RATE,
+                   input=True,
+                   frames_per_buffer=CHUNK)
+    
+    logger.info(f"Recording started at {RATE}Hz...")
+    frames = []
+    
+    # Record audio
+    for i in range(0, int(RATE / CHUNK * duration)):
+        data = stream.read(CHUNK)
+        frames.append(data)
+    
+    logger.info("Recording finished")
+    
+    # Stop and close the stream
+    stream.stop_stream()
+    stream.close()
+    p.terminate()
+    
+    # Save the recorded audio
+    wf = wave.open(output_file, 'wb')
+    wf.setnchannels(CHANNELS)
+    wf.setsampwidth(p.get_sample_size(FORMAT))
+    wf.setframerate(RATE)
+    wf.writeframes(b''.join(frames))
+    wf.close()
+    
+    logger.info(f"Audio saved to {output_file} at {RATE}Hz")
 
-# Run a synchronous voice interaction
-result = Runner.run_sync(
-    agent,
-    audio_bytes,
-    api_key="your-api-key"
-)
+def play_audio(audio_chunks):
+    """Play audio chunks using sounddevice."""
+    logger.info("Playing response audio...")
+    
+    # Combine all chunks
+    audio_data = b''.join(audio_chunks)
+    
+    # Convert to numpy array
+    audio_array = np.frombuffer(audio_data, dtype=np.int16)
+    
+    # Play audio
+    sd.play(audio_array, 24000)  # Using OpenAI's sample rate
+    sd.wait()  # Wait until audio is finished playing
+    
+    logger.info("Audio playback finished")
 
-# Save the response audio
-if result.audio_chunks:
-    with open("response.wav", "wb") as f:
-        for chunk in result.audio_chunks:
-            f.write(chunk)
+def main():
+    # Record audio
+    record_audio(duration=5, output_file="input.wav")
+    
+    # Create voice + text agent
+    voice_text_agent = Agent(
+        name="Voice Assistant",
+        instructions="You are a helpful assistant, respond to user in a friendly and helpful manner",
+        voice=Voice.SAGE,
+        input_audio=AudioConfig(
+            format=AudioFormat.PCM16,
+            sample_rate=24000,
+            channels=1
+        ),
+        output_audio=AudioConfig(
+            format=AudioFormat.PCM16,
+            sample_rate=24000,
+            channels=1
+        ),
+        enable_text=True  # Enable text modality
+    )
+    
+    def response_done_handler(response):
+        logger.info("Response done handler called")
+        logger.info(f"Response text: {response.text}")
+        if response.audio_chunks:
+            play_audio(response.audio_chunks)
+        else:
+            logger.warning("No audio response received")
+    
+    # Create runner
+    runner = Runner(voice_text_agent, is_streaming=True,
+                    on_response_done=response_done_handler)
+    
+    # Run the conversation
+    logger.info("Starting conversation...")
+    runner.init()
+    
+    try:
+        # Send the recorded audio file
+        with open("input.wav", "rb") as f:
+            audio_data = f.read()
+        runner._send_audio_input(audio_data)
+        
+        # Wait for the response to complete
+        time.sleep(10)  # Give enough time for the response to complete
+                
+    except KeyboardInterrupt:
+        logger.info("Stopping conversation...")
+    finally:
+        runner._disconnect()
+        # Clean up the temporary file
+        try:
+            os.remove("input.wav")
+        except:
+            pass
+
+if __name__ == "__main__":
+    main()
 ```
 
-### Streaming Response
+## Key Features
 
-```python
-from agents import Agent, Runner, Voice
-
-agent = Agent(
-    name="Streaming Assistant",
-    instructions="You are a helpful assistant"
-)
-
-# Get streaming response
-response = Runner.run_stream(
-    agent,
-    "Tell me a story",
-    api_key="your-api-key"
-)
-
-# Monitor the response as it comes in
-while not response.is_done:
-    if response.text:
-        print(response.text, end="", flush=True)
-    time.sleep(0.1)
-```
-
-### Using Tools
-
-```python
-from agents import Agent, Runner, Tool
-
-# Define a tool
-weather_tool = Tool(
-    name="get_weather",
-    description="Get the current weather for a location",
-    parameters={
-        "type": "object",
-        "properties": {
-            "location": {
-                "type": "string",
-                "description": "The city and state, e.g. San Francisco, CA"
-            }
-        },
-        "required": ["location"]
-    }
-)
-
-# Create an agent with the tool
-agent = Agent(
-    name="Weather Assistant",
-    instructions="You are a helpful weather assistant",
-    tools=[weather_tool]
-)
-
-# Run interaction
-result = Runner.run_sync(
-    agent,
-    "What's the weather like in San Francisco?",
-    api_key="your-api-key"
-)
-
-# Check for function calls
-if result.function_calls:
-    for call in result.function_calls:
-        print(f"Function call: {call}")
-```
-
-## Available Voices
-
-- ALLOY
-- ASH
-- BALLAD
-- CORAL
-- ECHO
-- SAGE
-- SHIMMER
-- VERSE
-
-## Features
-
-- Simple interface for text and voice interactions
-- Support for streaming responses
-- Built-in voice activity detection (VAD)
-- Function calling support
-- Thread-safe response handling
-- Automatic WebSocket connection management
-
-## Configuration
-
-### Session Configuration
-
-The `SessionConfig` class allows you to configure various aspects of the session:
-
-- `input_audio_format`: Audio format for input
-- `output_audio_format`: Audio format for output
-- `tools`: List of available functions
-- `tool_choice`: Function calling behavior
-
-### Response Configuration
-
-The `ResponseConfig` class allows you to configure individual responses:
-
-- `input_audio_format`: Audio format for this response
-- `output_audio_format`: Audio format for this response
-- `tools`: List of available functions for this response
-- `tool_choice`: Function calling behavior for this response
-- `conversation`: Conversation context
-- `metadata`: Custom metadata
-- `modalities`: List of modalities to use
-- `instructions`: Custom instructions
-- `input`: Custom input context
-
-## Environment Variables
-
-The SDK uses the following environment variables:
-
-- `OPENAI_API_KEY`: Your OpenAI API key
+- **Non-Streaming Mode**: Record audio, send it to OpenAI, and play the response.
+- **Streaming Mode**: Stream audio in real-time for interactive conversations.
+- **Audio Processing**: Convert audio to the required format (PCM16, 24000Hz, mono).
+- **Response Handling**: Use callbacks to handle text and audio responses.
 
 ## License
 
-MIT License 
+This project is licensed under the MIT License - see the LICENSE file for details. 
