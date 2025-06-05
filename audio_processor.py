@@ -1,5 +1,5 @@
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, List, Optional
 import subprocess
 import tempfile
 import os
@@ -93,190 +93,68 @@ class AudioProcessor:
                 logger.debug("Cleaned up temporary files")
 
     @staticmethod
-    def output_audio_codec(audio_data: bytes, output_format: AudioFormat, output_params: Dict[str, Any] = None) -> bytes:
-        """
-        Convert OpenAI's response (PCM16, 24000Hz, mono) to user's desired format.
-        
-        Args:
-            audio_data: Raw audio data from OpenAI (PCM16 WAV at 24000Hz mono)
-            output_format: Desired output format (WAV, MP3, etc.)
-            output_params: Optional parameters for output format (e.g., bitrate)
-            
-        Returns:
-            bytes: Converted audio data in the desired format
-        """
-        logger.info(f"Converting OpenAI response to {output_format.value}")
-        
-        # If output format is already PCM16 WAV, return as is
+    def buffer_audio_chunks(chunks: List[bytes]) -> bytes:
+        """Combine multiple audio chunks into a single buffer."""
+        return b''.join(chunks)
+
+    @staticmethod
+    def output_audio_codec(audio_data: bytes, output_format: AudioFormat, codec_params: Optional[Dict[str, Any]] = None) -> bytes:
+        """Convert audio data to the specified output format."""
         if output_format == AudioFormat.PCM16:
-            logger.info("Output format is already PCM16 WAV, skipping conversion")
-            return audio_data
+            return audio_data  # Already in PCM16 format
             
         # Create temporary files for input and output
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as input_file, \
-             tempfile.NamedTemporaryFile(suffix=f".{output_format.value}", delete=False) as output_file:
-            
-            logger.debug(f"Created temporary files: {input_file.name} -> {output_file.name}")
-            
-            # Write input data
-            input_file.write(audio_data)
-            input_file.flush()
-            logger.debug(f"Written {len(audio_data)} bytes to input file")
-            
-            # Build ffmpeg command
-            cmd = ["ffmpeg", "-y"]  # -y to overwrite output file
-            
-            # Input options - we know it's PCM16 WAV at 24000Hz
-            cmd.extend([
-                "-f", "wav",
-                "-ar", "24000",
-                "-i", input_file.name
-            ])
-            
-            # Output options based on desired format
-            if output_format == AudioFormat.OPUS:
-                cmd.extend([
-                    "-c:a", "libopus",
-                    "-b:a", str(output_params.get("bitrate", 64000)),
-                    "-application", output_params.get("application", "voip")
-                ])
-            elif output_format == AudioFormat.MP3:
-                cmd.extend([
-                    "-c:a", "libmp3lame",
-                    "-b:a", str(output_params.get("bitrate", 128000))
-                ])
-            elif output_format == AudioFormat.AAC:
-                cmd.extend([
-                    "-c:a", "aac",
-                    "-b:a", str(output_params.get("bitrate", 128000)),
-                    "-profile:a", output_params.get("profile", "aac_he")
-                ])
-            elif output_format == AudioFormat.FLAC:
-                cmd.extend(["-c:a", "flac"])
-            elif output_format == AudioFormat.WAV:
-                cmd.extend(["-c:a", "pcm_s16le"])
-            
-            cmd.append(output_file.name)
-            
-            logger.debug(f"Running ffmpeg command: {' '.join(cmd)}")
-            
-            # Run ffmpeg
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as input_file, \
+             tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as output_file:
             try:
-                result = subprocess.run(cmd, check=True, capture_output=True)
-                logger.debug("FFmpeg conversion completed successfully")
+                # Write input data to temporary file
+                input_file.write(audio_data)
+                input_file.flush()
                 
-                # Read output file
+                # Build ffmpeg command based on output format
+                if output_format == AudioFormat.MP3:
+                    cmd = [
+                        'ffmpeg', '-y',
+                        '-i', input_file.name,
+                        '-c:a', 'libmp3lame',
+                        '-q:a', str(codec_params.get('quality', 2) if codec_params else 2),
+                        output_file.name
+                    ]
+                elif output_format == AudioFormat.OPUS:
+                    cmd = [
+                        'ffmpeg', '-y',
+                        '-i', input_file.name,
+                        '-c:a', 'libopus',
+                        '-b:a', f"{codec_params.get('bitrate', 64)}k" if codec_params else '64k',
+                        output_file.name
+                    ]
+                elif output_format == AudioFormat.AAC:
+                    cmd = [
+                        'ffmpeg', '-y',
+                        '-i', input_file.name,
+                        '-c:a', 'aac',
+                        '-b:a', f"{codec_params.get('bitrate', 128)}k" if codec_params else '128k',
+                        output_file.name
+                    ]
+                else:
+                    raise ValueError(f"Unsupported output format: {output_format}")
+                
+                # Run ffmpeg command
+                logger.debug(f"Running ffmpeg command: {' '.join(cmd)}")
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                
+                if result.returncode != 0:
+                    logger.error(f"FFmpeg conversion failed: {result.stderr}")
+                    raise Exception(f"FFmpeg conversion failed: {result.stderr}")
+                
+                # Read converted audio data
                 with open(output_file.name, 'rb') as f:
-                    output_data = f.read()
-                    logger.info(f"Converted audio: {len(output_data)} bytes, format: {output_format.value}")
-                    return output_data
+                    return f.read()
                     
-            except subprocess.CalledProcessError as e:
-                logger.error(f"FFmpeg conversion failed: {e.stderr.decode()}")
-                raise
             finally:
                 # Clean up temporary files
-                os.unlink(input_file.name)
-                os.unlink(output_file.name)
-                logger.debug("Cleaned up temporary files")
-
-    @staticmethod
-    def process_response_audio(audio_data: bytes, output_config: AudioConfig) -> bytes:
-        """
-        Process audio response data from OpenAI.
-        
-        Args:
-            audio_data: Raw audio data from OpenAI
-            output_config: Output audio configuration
-            
-        Returns:
-            bytes: Processed audio data in the desired format
-        """
-        logger.info(f"Processing response audio to {output_config.format.value}")
-        
-        # If output format is already PCM16 WAV, return as is
-        if output_config.format == AudioFormat.PCM16:
-            logger.info("Output format is already PCM16 WAV, skipping conversion")
-            return audio_data
-            
-        # Create temporary files for input and output
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as input_file, \
-             tempfile.NamedTemporaryFile(suffix=f".{output_config.format.value}", delete=False) as output_file:
-            
-            logger.debug(f"Created temporary files: {input_file.name} -> {output_file.name}")
-            
-            # Write input data
-            input_file.write(audio_data)
-            input_file.flush()
-            logger.debug(f"Written {len(audio_data)} bytes to input file")
-            
-            # Build ffmpeg command
-            cmd = ["ffmpeg", "-y"]  # -y to overwrite output file
-            
-            # Input options - we know it's PCM16 WAV at 24000Hz
-            cmd.extend([
-                "-f", "wav",
-                "-ar", "24000",
-                "-i", input_file.name
-            ])
-            
-            # Output options based on desired format
-            if output_config.format == AudioFormat.OPUS:
-                cmd.extend([
-                    "-c:a", "libopus",
-                    "-b:a", str(output_config.codec_params.get("bitrate", 64000)),
-                    "-application", output_config.codec_params.get("application", "voip")
-                ])
-            elif output_config.format == AudioFormat.MP3:
-                cmd.extend([
-                    "-c:a", "libmp3lame",
-                    "-b:a", str(output_config.codec_params.get("bitrate", 128000))
-                ])
-            elif output_config.format == AudioFormat.AAC:
-                cmd.extend([
-                    "-c:a", "aac",
-                    "-b:a", str(output_config.codec_params.get("bitrate", 128000)),
-                    "-profile:a", output_config.codec_params.get("profile", "aac_he")
-                ])
-            elif output_config.format == AudioFormat.FLAC:
-                cmd.extend(["-c:a", "flac"])
-            elif output_config.format == AudioFormat.WAV:
-                cmd.extend(["-c:a", "pcm_s16le"])
-            
-            cmd.append(output_file.name)
-            
-            logger.debug(f"Running ffmpeg command: {' '.join(cmd)}")
-            
-            # Run ffmpeg
-            try:
-                result = subprocess.run(cmd, check=True, capture_output=True)
-                logger.debug("FFmpeg conversion completed successfully")
-                
-                # Read output file
-                with open(output_file.name, 'rb') as f:
-                    output_data = f.read()
-                    logger.info(f"Converted audio: {len(output_data)} bytes, format: {output_config.format.value}")
-                    return output_data
-                    
-            except subprocess.CalledProcessError as e:
-                logger.error(f"FFmpeg conversion failed: {e.stderr.decode()}")
-                raise
-            finally:
-                # Clean up temporary files
-                os.unlink(input_file.name)
-                os.unlink(output_file.name)
-                logger.debug("Cleaned up temporary files")
-
-    @staticmethod
-    def buffer_audio_chunks(chunks: list[bytes]) -> bytes:
-        """
-        Combine multiple audio chunks into a single audio buffer.
-        
-        Args:
-            chunks: List of audio data chunks
-            
-        Returns:
-            bytes: Combined audio data
-        """
-        logger.debug(f"Combining {len(chunks)} audio chunks")
-        return b''.join(chunks) 
+                try:
+                    os.unlink(input_file.name)
+                    os.unlink(output_file.name)
+                except Exception as e:
+                    logger.warning(f"Error cleaning up temporary files: {e}") 

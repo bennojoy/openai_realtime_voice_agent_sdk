@@ -61,6 +61,8 @@ class AudioPlayer:
                     if not self.buffer:
                         self.is_playing = False
                         logger.debug("Buffer empty, stopping playback")
+                        global is_streaming
+                        is_streaming = True  # Resume recording when playback is done
                         break
                     
                     # Get next chunk to play
@@ -152,29 +154,7 @@ def main():
     # Initialize the voice agent
     agent = Agent(
         name="Voice Assistant",
-        instructions="You are a helpful assistant. Respond to the user in a friendly and helpful manner.",
-        model="gpt-4o-realtime-preview-2024-12-17",
-        voice=Voice.ALLOY,
-        input_audio=AudioConfig(
-            format=AudioFormat.PCM16,
-            sample_rate=24000,
-            channels=1
-        ),
-        output_audio=AudioConfig(
-            format=AudioFormat.PCM16,
-            sample_rate=24000,
-            channels=1
-        ),
-        tools=[],
-        temperature=0.7,
-        max_response_output_tokens=500,
-        turn_detection={
-            "type": "server_vad",
-            "threshold": 0.9,
-            "prefix_padding_ms": 300,
-            "silence_duration_ms": 2000,
-            "create_response": True
-        }
+        instructions="You are a helpful assistant. Respond to the user in a friendly and helpful manner."
     )
 
     # Initialize audio player
@@ -202,7 +182,6 @@ def main():
         logger.info(f"AI transcript handler called with: {transcript}")
         print(f"\nAI (transcribed): {transcript}")
 
-        
     def handle_speech_stopped():
         """Handle VAD detection of speech end"""
         global is_streaming
@@ -211,46 +190,20 @@ def main():
         # Stop audio streaming when speech ends
         is_streaming = False
         logger.info("Stopped audio streaming")
-        
-    def handle_response_done(response_data):
-        """Handle completion of AI response"""
-        logger.info(f"Response done handler called with data: {response_data}")
-        print("\nAI response complete. You can speak again or press Ctrl+C to exit.")
-        
-    def handle_audio_transcript_done():
-        """Handle completion of AI audio transcript"""
 
-        logger.info("Audio transcript done handler called")
-        print("\nAudio transcript complete. You can speak again or press Ctrl+C to exit.")
-        # Resume audio streaming when AI's response is complete
-        is_streaming = True
-    
     try:
-        # Create runner and start streaming
-        logger.info("Initializing runner...")
-        runner = Runner(api_key=os.getenv("OPENAI_API_KEY"))
-        runner.agent = agent
-        runner._is_streaming = True
-        runner.on_audio_delta = handle_audio_delta
-        runner.on_transcript_user = handle_user_transcript
-        runner.on_transcript_ai = handle_ai_transcript
-        runner.on_speech_stopped = handle_speech_stopped
-        runner.on_response_done = handle_response_done
-        runner.on_audio_transcript_done = handle_audio_transcript_done
-        logger.info("All handlers registered")
+        # Create runner with agent and callbacks
+        runner = Runner(
+            agent=agent,
+            on_audio_delta=handle_audio_delta,
+            on_transcript_user=handle_user_transcript,
+            on_transcript_ai=handle_ai_transcript,
+            on_speech_stopped=handle_speech_stopped
+        )
         
-        # Connect and wait for session creation
-        logger.info("Connecting to websocket...")
-        runner._connect()
-        logger.info("Updating session configuration...")
-        runner._update_session(agent, is_streaming=True)
-        try:
-            runner._session_updated.wait(timeout=10)
-            logger.info("Session configuration updated successfully")
-        except Exception as e:
-            logger.error(f"Failed to update session configuration: {e}")
-            raise
-
+        # Initialize connection and session
+        runner.init()
+        
         print("Starting voice interaction... (Press Ctrl+C to stop)")
         print("Speak into your microphone...")
         

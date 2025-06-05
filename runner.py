@@ -35,17 +35,37 @@ class Runner:
     for voice interactions with the agent.
     """
     
-    def __init__(self, api_key: Optional[str] = None):
+    def __init__(self, 
+                 agent: Agent,
+                 api_key: Optional[str] = None, 
+                 is_streaming: bool = True,
+                 on_audio_delta: Optional[Callable[[str], None]] = None,
+                 on_transcript_user: Optional[Callable[[str], None]] = None,
+                 on_transcript_ai: Optional[Callable[[str], None]] = None,
+                 on_speech_stopped: Optional[Callable[[], None]] = None):
         """
         Initialize the runner.
         
         Args:
+            agent: The agent to use for the interaction
             api_key: OpenAI API key. If not provided, will try to get from OPENAI_API_KEY environment variable.
+            is_streaming: Whether to use streaming mode
+            on_audio_delta: Callback for audio delta events
+            on_transcript_user: Callback for user transcript events
+            on_transcript_ai: Callback for AI transcript events
+            on_speech_stopped: Callback for speech stopped events
         """
         self.api_key = api_key or os.getenv('OPENAI_API_KEY')
         if not self.api_key:
             raise ValueError("API key must be provided either as a parameter or through OPENAI_API_KEY environment variable")
             
+        self.agent = agent
+        self._is_streaming = is_streaming
+        self.on_audio_delta = on_audio_delta
+        self.on_transcript_user = on_transcript_user
+        self.on_transcript_ai = on_transcript_ai
+        self.on_speech_stopped = on_speech_stopped
+        
         self.ws = None
         self.response_queue = queue.Queue()
         self.current_response = Response()
@@ -53,14 +73,21 @@ class Runner:
         self._connected = threading.Event()
         self._session_updated = threading.Event()
         self._audio_buffer = []
-        self._is_streaming = False
-        self.agent = None  # Will be set during run_sync or run_stream
-        self.on_audio_delta = None  # Initialize on_audio_delta as None
-        self.on_transcript_user = None  # Initialize user transcript callback
-        self.on_transcript_ai = None  # Initialize AI transcript callback
-        self.on_speech_stopped = None  # Initialize speech stopped callback
         self.on_response_done = None  # Initialize response done callback
         self.on_audio_transcript_done = None  # Initialize audio transcript done callback
+
+    def init(self):
+        """Initialize the connection and session configuration"""
+        logger.info("Initializing runner...")
+        self._connect()
+        logger.info("Updating session configuration...")
+        self._update_session(self.agent, is_streaming=self._is_streaming)
+        try:
+            self._session_updated.wait(timeout=10)
+            logger.info("Session configuration updated successfully")
+        except Exception as e:
+            logger.error(f"Failed to update session configuration: {e}")
+            raise
 
     def _on_message(self, ws, message):
         event = json.loads(message)
@@ -115,7 +142,11 @@ class Runner:
             with self._lock:
                 if self._audio_buffer:
                     combined_audio = AudioProcessor.buffer_audio_chunks(self._audio_buffer)
-                    processed_audio = AudioProcessor.process_response_audio(combined_audio, self.agent.output_audio)
+                    processed_audio = AudioProcessor.output_audio_codec(
+                        combined_audio,
+                        self.agent.output_audio.format,
+                        self.agent.output_audio.codec_params
+                    )
                     self.current_response.audio_chunks.append(processed_audio)
                     self._audio_buffer = []  # Clear the buffer
         elif event_type == "conversation.item.input_audio_transcription.completed":
@@ -243,22 +274,84 @@ class Runner:
         logger.debug(f"Sending text event: {json.dumps(event, indent=2)}")
         self.ws.send(json.dumps(event))
 
-    def _send_audio_input(self, audio_data: bytes, streaming: bool = False):
+    def _send_audio_input(self, input_data: Union[str, bytes], streaming: bool = False):
         """Send audio input to the WebSocket."""
-        logger.info(f"Sending audio input (streaming={streaming}, size={len(audio_data)} bytes)")
+        logger.info(f"Processing input data (streaming={streaming})")
+        
+        if isinstance(input_data, str):
+            if input_data.endswith(('.wav', '.mp3', '.flac', '.opus', '.aac')):
+                # It's an audio file path
+                logger.info(f"Processing audio file: {input_data}")
+                # Read the file and determine its format
+                with open(input_data, 'rb') as f:
+                    audio_data = f.read()
+                input_format = AudioFormat.WAV if input_data.endswith('.wav') else \
+                             AudioFormat.MP3 if input_data.endswith('.mp3') else \
+                             AudioFormat.FLAC if input_data.endswith('.flac') else \
+                             AudioFormat.OPUS if input_data.endswith('.opus') else \
+                             AudioFormat.AAC
+                # Convert to OpenAI format
+                audio_bytes = AudioProcessor.input_audio_codec(audio_data, input_format)
+                self._send_audio_bytes(audio_bytes, streaming)
+            else:
+                # It's a text input
+                logger.info("Sending text input")
+                self._send_text_input(input_data)
+        else:
+            # It's audio bytes, check if it matches agent's audio config
+            if (self.agent.input_audio.format == AudioFormat.PCM16 and 
+                self.agent.input_audio.sample_rate == 24000 and 
+                self.agent.input_audio.channels == 1):
+                # Already in correct format, sample rate, and channels, send directly
+                logger.info("Input matches agent's audio config (PCM16, 24kHz, mono), sending directly")
+                self._send_audio_bytes(input_data, streaming)
+            else:
+                # Try to detect format from magic bytes
+                logger.info(f"Processing audio bytes: {len(input_data)} bytes")
+                if input_data.startswith(b'RIFF') and input_data[8:12] == b'WAVE':
+                    input_format = AudioFormat.WAV
+                    logger.debug("Detected WAV format from magic bytes")
+                elif input_data.startswith(b'ID3') or input_data.startswith(b'\xFF\xFB'):
+                    input_format = AudioFormat.MP3
+                    logger.debug("Detected MP3 format from magic bytes")
+                elif input_data.startswith(b'fLaC'):
+                    input_format = AudioFormat.FLAC
+                    logger.debug("Detected FLAC format from magic bytes")
+                elif input_data.startswith(b'OggS'):
+                    # Check if it's Opus by looking for OpusHead in the Ogg container
+                    if b'OpusHead' in input_data[:100]:
+                        input_format = AudioFormat.OPUS
+                        logger.debug("Detected OPUS format from magic bytes")
+                    else:
+                        input_format = AudioFormat.OGG
+                        logger.debug("Detected OGG format from magic bytes")
+                elif input_data.startswith(b'\xFF\xF1') or input_data.startswith(b'\xFF\xF9'):
+                    input_format = AudioFormat.AAC
+                    logger.debug("Detected AAC format from magic bytes")
+                else:
+                    # If we can't detect the format, assume PCM16 WAV
+                    logger.warning("Could not detect audio format from magic bytes, assuming PCM16 WAV")
+                    input_format = AudioFormat.PCM16
+                
+                audio_bytes = AudioProcessor.input_audio_codec(input_data, input_format)
+                self._send_audio_bytes(audio_bytes, streaming)
+
+    def _send_audio_bytes(self, audio_bytes: bytes, streaming: bool):
+        """Send processed audio bytes to the WebSocket."""
+        logger.info(f"Sending audio bytes (streaming={streaming}, size={len(audio_bytes)} bytes)")
         
         if streaming:
             logger.debug("Sending streaming audio chunk")
             self.ws.send(json.dumps({
                 "type": "input_audio_buffer.append",
-                "audio": base64.b64encode(audio_data).decode()
+                "audio": base64.b64encode(audio_bytes).decode()
             }))
         else:
             logger.debug("Sending complete audio message")
             # For sync mode, we need to append the audio and then commit it
             self.ws.send(json.dumps({
                 "type": "input_audio_buffer.append",
-                "audio": base64.b64encode(audio_data).decode()
+                "audio": base64.b64encode(audio_bytes).decode()
             }))
             logger.debug("Appending audio data")
             
@@ -267,7 +360,6 @@ class Runner:
                 "type": "input_audio_buffer.commit"
             }))
             logger.debug("Committed audio buffer")
-          
 
     def _create_response(self):
         logger.info("Creating response")
@@ -275,189 +367,4 @@ class Runner:
             "type": "response.create"
         }
         logger.debug("Sending response create event")
-        self.ws.send(json.dumps(event))
-
-    @staticmethod
-    def run_sync(agent: Agent, input_data: Union[str, bytes], api_key: str) -> Response:
-        """
-        Run a synchronous interaction with the agent.
-        """
-        logger.info("Starting synchronous interaction")
-        runner = Runner(api_key)
-        runner.agent = agent  # Set the agent for audio processing
-        
-        # Connect and wait for session creation
-        logger.info("Connecting to WebSocket...")
-        runner._connect()
-        
-        # Update session with VAD disabled
-        logger.info("Updating session configuration...")
-        runner._update_session(agent, is_streaming=False)
-        try:
-            runner._session_updated.wait(timeout=10)
-        except Exception as e:
-            logger.error(f"Failed to update session configuration: {e}")
-            raise
-
-        if isinstance(input_data, str):
-            if input_data.endswith(('.wav', '.mp3', '.flac', '.opus', '.aac')):
-                # It's an audio file path
-                logger.info(f"Processing audio file: {input_data}")
-                # Read the file and determine its format
-                with open(input_data, 'rb') as f:
-                    audio_data = f.read()
-                input_format = AudioFormat.WAV if input_data.endswith('.wav') else \
-                             AudioFormat.MP3 if input_data.endswith('.mp3') else \
-                             AudioFormat.FLAC if input_data.endswith('.flac') else \
-                             AudioFormat.OPUS if input_data.endswith('.opus') else \
-                             AudioFormat.AAC
-                # Convert to OpenAI format
-                audio_bytes = AudioProcessor.input_audio_codec(audio_data, input_format)
-                runner._send_audio_input(audio_bytes, streaming=False)
-            else:
-                # It's a text input
-                logger.info("Sending text input")
-                runner._send_text_input(input_data)
-        else:
-            # It's audio bytes, detect format from the data
-            logger.info(f"Processing audio bytes: {len(input_data)} bytes")
-            # Try to detect format from magic bytes
-            if input_data.startswith(b'RIFF') and input_data[8:12] == b'WAVE':
-                input_format = AudioFormat.WAV
-                logger.debug("Detected WAV format from magic bytes")
-            elif input_data.startswith(b'ID3') or input_data.startswith(b'\xFF\xFB'):
-                input_format = AudioFormat.MP3
-                logger.debug("Detected MP3 format from magic bytes")
-            elif input_data.startswith(b'fLaC'):
-                input_format = AudioFormat.FLAC
-                logger.debug("Detected FLAC format from magic bytes")
-            elif input_data.startswith(b'OggS'):
-                # Check if it's Opus by looking for OpusHead in the Ogg container
-                if b'OpusHead' in input_data[:100]:
-                    input_format = AudioFormat.OPUS
-                    logger.debug("Detected OPUS format from magic bytes")
-                else:
-                    input_format = AudioFormat.OGG
-                    logger.debug("Detected OGG format from magic bytes")
-            elif input_data.startswith(b'\xFF\xF1') or input_data.startswith(b'\xFF\xF9'):
-                input_format = AudioFormat.AAC
-                logger.debug("Detected AAC format from magic bytes")
-            else:
-                # If we can't detect the format, assume PCM16 WAV
-                logger.warning("Could not detect audio format from magic bytes, assuming PCM16 WAV")
-                input_format = AudioFormat.PCM16
-            
-            audio_bytes = AudioProcessor.input_audio_codec(input_data, input_format)
-            runner._send_audio_input(audio_bytes, streaming=False)
-
-        # For sync mode, we need to explicitly create response
-        logger.info("Creating response...")
-        runner._create_response()
-        logger.info("Waiting for response...")
-        response = runner.response_queue.get()
-        
-        # Convert response audio to desired format if needed
-        if response.audio_chunks and agent.output_audio.format != AudioFormat.PCM16:
-            logger.info(f"Converting response audio to {agent.output_audio.format.value}")
-            converted_chunks = []
-            for chunk in response.audio_chunks:
-                converted_chunk = AudioProcessor.output_audio_codec(
-                    chunk,
-                    agent.output_audio.format,
-                    agent.output_audio.codec_params
-                )
-                converted_chunks.append(converted_chunk)
-            response.audio_chunks = converted_chunks
-            
-        return response
-
-    @staticmethod
-    def run_stream(agent: Agent, input_data: Union[str, bytes], api_key: str, 
-                  on_text: Optional[Callable[[str], None]] = None,
-                  on_audio_delta: Optional[Callable[[str], None]] = None,
-                  on_transcript_user: Optional[Callable[[str], None]] = None,
-                  on_transcript_ai: Optional[Callable[[str], None]] = None,
-                  on_speech_stopped: Optional[Callable[[], None]] = None,
-                  on_response_done: Optional[Callable[[Dict[str, Any]], None]] = None,
-                  on_audio_transcript_done: Optional[Callable[[], None]] = None) -> Response:
-        """
-        Run a streaming interaction with the agent.
-        """
-        logger.info("Starting streaming interaction")
-        runner = Runner(api_key)
-        runner.agent = agent  # Set the agent for audio processing
-        runner._is_streaming = True
-        runner.on_audio_delta = on_audio_delta  # Store the audio delta callback
-        runner.on_transcript_user = on_transcript_user  # Store user transcript callback
-        runner.on_transcript_ai = on_transcript_ai  # Store AI transcript callback
-        runner.on_speech_stopped = on_speech_stopped  # Store speech stopped callback
-        runner.on_response_done = on_response_done  # Store response done callback
-        runner.on_audio_transcript_done = on_audio_transcript_done  # Store audio transcript done callback
-        
-        # Connect and wait for session creation
-        logger.info("Connecting to WebSocket...")
-        runner._connect()
-        
-        # Update session with VAD enabled
-        logger.info("Updating session configuration...")
-        runner._update_session(agent, is_streaming=True)
-        try:
-            runner._session_updated.wait(timeout=10)
-        except Exception as e:
-            logger.error(f"Failed to update session configuration: {e}")
-            raise
-
-        if isinstance(input_data, str):
-            if input_data.endswith(('.wav', '.mp3', '.flac', '.opus', '.aac')):
-                # It's an audio file path
-                logger.info(f"Processing audio file: {input_data}")
-                # Read the file and determine its format
-                with open(input_data, 'rb') as f:
-                    audio_data = f.read()
-                input_format = AudioFormat.WAV if input_data.endswith('.wav') else \
-                             AudioFormat.MP3 if input_data.endswith('.mp3') else \
-                             AudioFormat.FLAC if input_data.endswith('.flac') else \
-                             AudioFormat.OPUS if input_data.endswith('.opus') else \
-                             AudioFormat.AAC
-                # Convert to OpenAI format
-                audio_bytes = AudioProcessor.input_audio_codec(audio_data, input_format)
-                runner._send_audio_input(audio_bytes, streaming=True)
-            else:
-                # It's a text input
-                logger.info("Sending text input")
-                runner._send_text_input(input_data)
-        else:
-            # It's audio bytes, detect format from the data
-            logger.info(f"Processing audio bytes: {len(input_data)} bytes")
-            # Try to detect format from magic bytes
-            if input_data.startswith(b'RIFF') and input_data[8:12] == b'WAVE':
-                input_format = AudioFormat.WAV
-                logger.debug("Detected WAV format from magic bytes")
-            elif input_data.startswith(b'ID3') or input_data.startswith(b'\xFF\xFB'):
-                input_format = AudioFormat.MP3
-                logger.debug("Detected MP3 format from magic bytes")
-            elif input_data.startswith(b'fLaC'):
-                input_format = AudioFormat.FLAC
-                logger.debug("Detected FLAC format from magic bytes")
-            elif input_data.startswith(b'OggS'):
-                # Check if it's Opus by looking for OpusHead in the Ogg container
-                if b'OpusHead' in input_data[:100]:
-                    input_format = AudioFormat.OPUS
-                    logger.debug("Detected OPUS format from magic bytes")
-                else:
-                    input_format = AudioFormat.OGG
-                    logger.debug("Detected OGG format from magic bytes")
-            elif input_data.startswith(b'\xFF\xF1') or input_data.startswith(b'\xFF\xF9'):
-                input_format = AudioFormat.AAC
-                logger.debug("Detected AAC format from magic bytes")
-            else:
-                # If we can't detect the format, assume PCM16 WAV
-                logger.warning("Could not detect audio format from magic bytes, assuming PCM16 WAV")
-                input_format = AudioFormat.PCM16
-            
-            audio_bytes = AudioProcessor.input_audio_codec(input_data, input_format)
-            runner._send_audio_input(audio_bytes, streaming=True)
-
-        # For streaming mode, response is created automatically by VAD
-        logger.info("Streaming interaction started")
-        return runner.current_response 
+        self.ws.send(json.dumps(event)) 
