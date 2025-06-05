@@ -6,7 +6,7 @@ This SDK provides a Python interface for interacting with OpenAI's Realtime API 
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/yourusername/openai-realtime-websocket-python-sdk.git
+   git clone https://github.com/bennojoy/openai-realtime-websocket-python-sdk.git
    cd openai-realtime-websocket-python-sdk
    ```
 
