@@ -37,6 +37,11 @@ class AudioFormat(Enum):
     WAV = "wav"
 
 @dataclass
+class TextConfig:
+    """Text configuration for input and output."""
+    type: str = "text"  # text or markdown
+
+@dataclass
 class AudioConfig:
     """Audio configuration for input and output."""
     format: AudioFormat = AudioFormat.PCM16

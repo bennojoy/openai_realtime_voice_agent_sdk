@@ -29,7 +29,7 @@ def record_audio(duration=5, output_file="input.wav"):
     CHUNK = 1024
     FORMAT = pyaudio.paInt16
     CHANNELS = 1
-    RATE = 24000
+    RATE = 48000
     
     p = pyaudio.PyAudio()
     

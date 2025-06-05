@@ -55,6 +55,12 @@ class Runner:
         self._audio_buffer = []
         self._is_streaming = False
         self.agent = None  # Will be set during run_sync or run_stream
+        self.on_audio_delta = None  # Initialize on_audio_delta as None
+        self.on_transcript_user = None  # Initialize user transcript callback
+        self.on_transcript_ai = None  # Initialize AI transcript callback
+        self.on_speech_stopped = None  # Initialize speech stopped callback
+        self.on_response_done = None  # Initialize response done callback
+        self.on_audio_transcript_done = None  # Initialize audio transcript done callback
 
     def _on_message(self, ws, message):
         event = json.loads(message)
@@ -86,12 +92,22 @@ class Runner:
             # Don't clear the event here, let _update_session handle it
             self._session_updated.set()
             logger.debug(f"Session updated: {json.dumps(event, indent=2)}")
-            
+        elif event_type == "input_audio_buffer.speech_stopped":
+            # Handle VAD detection of speech end
+            logger.info("VAD detected end of speech")
+            if hasattr(self, 'on_speech_stopped') and self.on_speech_stopped:
+                self.on_speech_stopped()
         elif event_type == "response.text.delta":
             with self._lock:
                 self.current_response.text += event.get("delta", "")
         elif event_type == "response.audio.delta":
-            audio_data = base64.b64decode(event.get("delta", ""))
+            # Get the delta data
+            delta = event.get("delta", "")
+            # If we have an audio delta callback, call it immediately
+            if hasattr(self, 'on_audio_delta') and self.on_audio_delta:
+                self.on_audio_delta(delta)
+            # Also buffer the audio data for complete response
+            audio_data = base64.b64decode(delta)
             with self._lock:
                 self._audio_buffer.append(audio_data)
         elif event_type == "response.audio.done":
@@ -102,6 +118,19 @@ class Runner:
                     processed_audio = AudioProcessor.process_response_audio(combined_audio, self.agent.output_audio)
                     self.current_response.audio_chunks.append(processed_audio)
                     self._audio_buffer = []  # Clear the buffer
+        elif event_type == "conversation.item.input_audio_transcription.completed":
+            # Handle user's speech transcription
+            if hasattr(self, 'on_transcript_user') and self.on_transcript_user:
+                transcript = event.get("transcript", "")
+                self.on_transcript_user(transcript)
+        elif event_type == "response.audio_transcript.done":
+            # Handle AI's speech transcription
+            if hasattr(self, 'on_transcript_ai') and self.on_transcript_ai:
+                transcript = event.get("transcript", "")
+                self.on_transcript_ai(transcript)
+            # Call audio transcript done callback
+            if hasattr(self, 'on_audio_transcript_done') and self.on_audio_transcript_done:
+                self.on_audio_transcript_done()
         elif event_type == "response.function_call_arguments.delta":
             with self._lock:
                 self.current_response.function_calls.append(event.get("delta", {}))
@@ -110,6 +139,9 @@ class Runner:
                 self.current_response.is_done = True
                 if not self._is_streaming:
                     self.response_queue.put(self.current_response)
+                # Call response done callback
+                if hasattr(self, 'on_response_done') and self.on_response_done:
+                    self.on_response_done(event)
                 self.current_response = Response()
 
     def _on_error(self, ws, error):
@@ -125,6 +157,20 @@ class Runner:
         Called when WebSocket connection is established.
         """
         logger.info("WebSocket connection established")
+
+    def _disconnect(self):
+        """
+        Disconnect the WebSocket connection.
+        """
+        logger.info("Disconnecting WebSocket...")
+        if self.ws is not None:
+            try:
+                self.ws.close()
+            except Exception as e:
+                logger.error(f"Error closing WebSocket: {e}")
+            finally:
+                self.ws = None
+        logger.info("WebSocket disconnected")
 
     def _connect(self):
         """
@@ -328,7 +374,12 @@ class Runner:
     @staticmethod
     def run_stream(agent: Agent, input_data: Union[str, bytes], api_key: str, 
                   on_text: Optional[Callable[[str], None]] = None,
-                  on_audio: Optional[Callable[[bytes], None]] = None) -> Response:
+                  on_audio_delta: Optional[Callable[[str], None]] = None,
+                  on_transcript_user: Optional[Callable[[str], None]] = None,
+                  on_transcript_ai: Optional[Callable[[str], None]] = None,
+                  on_speech_stopped: Optional[Callable[[], None]] = None,
+                  on_response_done: Optional[Callable[[Dict[str, Any]], None]] = None,
+                  on_audio_transcript_done: Optional[Callable[[], None]] = None) -> Response:
         """
         Run a streaming interaction with the agent.
         """
@@ -336,6 +387,12 @@ class Runner:
         runner = Runner(api_key)
         runner.agent = agent  # Set the agent for audio processing
         runner._is_streaming = True
+        runner.on_audio_delta = on_audio_delta  # Store the audio delta callback
+        runner.on_transcript_user = on_transcript_user  # Store user transcript callback
+        runner.on_transcript_ai = on_transcript_ai  # Store AI transcript callback
+        runner.on_speech_stopped = on_speech_stopped  # Store speech stopped callback
+        runner.on_response_done = on_response_done  # Store response done callback
+        runner.on_audio_transcript_done = on_audio_transcript_done  # Store audio transcript done callback
         
         # Connect and wait for session creation
         logger.info("Connecting to WebSocket...")
@@ -402,32 +459,5 @@ class Runner:
             runner._send_audio_input(audio_bytes, streaming=True)
 
         # For streaming mode, response is created automatically by VAD
-        # Set up callbacks
-        if on_text:
-            logger.info("Setting up text callback")
-            def text_callback():
-                while not runner.current_response.is_done:
-                    if runner.current_response.text:
-                        on_text(runner.current_response.text)
-                    time.sleep(0.1)
-            threading.Thread(target=text_callback, daemon=True).start()
-            
-        if on_audio:
-            logger.info("Setting up audio callback")
-            def audio_callback():
-                while not runner.current_response.is_done:
-                    if runner.current_response.audio_chunks:
-                        for chunk in runner.current_response.audio_chunks:
-                            # Convert each chunk to desired format if needed
-                            if agent.output_audio.format != AudioFormat.PCM16:
-                                chunk = AudioProcessor.output_audio_codec(
-                                    chunk,
-                                    agent.output_audio.format,
-                                    agent.output_audio.codec_params
-                                )
-                            on_audio(chunk)
-                    time.sleep(0.1)
-            threading.Thread(target=audio_callback, daemon=True).start()
-            
         logger.info("Streaming interaction started")
         return runner.current_response 
