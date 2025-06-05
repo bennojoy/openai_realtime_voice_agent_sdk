@@ -11,7 +11,7 @@ setup(
         "numpy",
     ],
     author="Benno Joy",
-    author_email="your.email@example.com",
+    author_email="bennojoy@gmail.com",
     description="A Python SDK for interacting with OpenAI's Realtime API using WebSockets",
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
